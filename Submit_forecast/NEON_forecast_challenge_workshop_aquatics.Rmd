@@ -68,7 +68,7 @@ Today we will focus on lake sites only and will start with forecasting water tem
 
 For the Challange, forecasts must include quantified uncertainty. The file can represent uncertainty using an ensemble forecast (multiple realizations of future conditions) or a distribution forecast (with mean and standard deviation), specified in the family and parameter columns of the forecast file. 
 
-For an ensemble forecast, the `family` column uses the word `ensemble` to designate that it is a ensemble forecast and the parameter column is the ensemble member number (1, 2, 3 …).  For a distribution forecast, the `family` column uses the word `normal` to designate a normal distribution and the parameter column must have the words mu and sigma for each forecasted variable, site_id, and datetime. For forecasts that don't have a normal distribution we recommend using the ensemble format and sampling from your non-normal distribution to generate a set of ensemble members that represents your distribution. I will go through examples of both `ensemble` and `normal` forecasts as examples. 
+For an ensemble forecast, the `family` column uses the word `ensemble` to designate that it is a ensemble forecast and the parameter column is the ensemble member number (1, 2, 3 .).  For a distribution forecast, the `family` column uses the word `normal` to designate a normal distribution and the parameter column must have the words mu and sigma for each forecasted variable, site_id, and datetime. For forecasts that don't have a normal distribution we recommend using the ensemble format and sampling from your non-normal distribution to generate a set of ensemble members that represents your distribution. I will go through examples of both `ensemble` and `normal` forecasts as examples. 
 
 The full list of required columns and format can be found in the [Challenge documentation](https://projects.ecoforecast.org/neon4cast-docs/Submission-Instructions.html).
 
@@ -169,7 +169,7 @@ Note: This code chunk can take a few minutes to execute as it accesses the NOAA 
 # past stacked weather
 noaa_past_s3 <- neon4cast::noaa_stage3()
 
-variables <- c("air_temperature")
+variables <- c("air_temperature", "eastward_wind", "northward_wind")
 #Other variable names can be found at https://projects.ecoforecast.org/neon4cast-docs/Shared-Forecast-Drivers.html#stage-3
 
 noaa_past <- noaa_past_s3  |> 
@@ -178,7 +178,18 @@ noaa_past <- noaa_past_s3  |>
                 variable %in% variables) |> 
   dplyr::collect()
 
-noaa_past
+if("eastward_wind" %in% variables & "northward_wind" %in% variables){
+  # Calculate wind speed from u and v wind
+  noaa_past_wind = noaa_past[noaa_past$variable == "eastward_wind",]
+  noaa_past_wind$variable = "wind_speed"
+  noaa_past_wind$prediction = sqrt(noaa_past[noaa_past$variable == "eastward_wind", "prediction"][[1L]]^2 +
+                                     noaa_past[noaa_past$variable == "northward_wind", "prediction"][[1L]]^2)
+  
+  noaa_past = noaa_past[noaa_past$variable == "air_temperature",]
+  noaa_past = rbind(noaa_past, noaa_past_wind)
+}
+
+# noaa_past
 ```
 
 This is a stacked ensemble forecast of the one day ahead forecasts. To get an estimate of the historic conditions we can take a mean of these ensembles. We will also need to convert the temperatures to Celsius from Kelvin.
@@ -204,14 +215,27 @@ We can then look at the future weather forecasts in the same way but using the `
 forecast_date <- Sys.Date() 
 noaa_date <- forecast_date - days(1)
 
-noaa_future_s3 <- neon4cast::noaa_stage2(start_date = as.character(noaa_date))
-variables <- c("air_temperature")
+# noaa_future_s3 <- neon4cast::noaa_stage2(start_date = as.character(noaa_date))
+noaa_future_s3 <- neon4cast::noaa_stage2()
+variables <- c("air_temperature", "eastward_wind", "northward_wind")
 
 noaa_future <- noaa_future_s3 |> 
-  dplyr::filter(datetime >= forecast_date,
+  dplyr::filter(start_date == as.character(noaa_date), # This was my addition to avoid error with noaa_stage2 function
+                datetime >= forecast_date,
                 site_id %in% lake_sites$field_site_id,
                 variable %in% variables) |> 
   collect()
+
+if("eastward_wind" %in% variables & "northward_wind" %in% variables){
+  # Calculate wind speed from u and v wind
+  noaa_future_wind = noaa_future[noaa_future$variable == "eastward_wind",]
+  noaa_future_wind$variable = "wind_speed"
+  noaa_future_wind$prediction = sqrt(noaa_future[noaa_future$variable == "eastward_wind", "prediction"][[1L]]^2 +
+                                     noaa_future[noaa_future$variable == "northward_wind", "prediction"][[1L]]^2)
+  
+  noaa_future = noaa_future[noaa_future$variable == "air_temperature",]
+  noaa_future = rbind(noaa_future, noaa_future_wind)
+}
 
 ```
 
@@ -226,7 +250,7 @@ noaa_future_daily <- noaa_future |>
   pivot_wider(names_from = variable, values_from = prediction) |>
   # convert to Celsius
   mutate(air_temperature = air_temperature - 273.15) |> 
-  select(datetime, site_id, air_temperature, parameter)
+  select(datetime, site_id, air_temperature, wind_speed, parameter)
 
 noaa_future_daily
 ```
@@ -244,6 +268,19 @@ ggplot(noaa_future_daily, aes(x=datetime, y=air_temperature)) +
   coord_cartesian(xlim = c(noaa_date - days(60),
                            noaa_date + days(35)))+
   facet_wrap(~site_id, scales = 'free')
+
+# Wind speed plots
+ggplot(noaa_future_daily, aes(x=datetime, y=wind_speed)) +
+  geom_line(aes(group = parameter), alpha = 0.4)+
+  geom_line(data = noaa_past_mean, colour = 'darkblue') +
+  facet_wrap(~site_id, scales = 'free')
+ggplot(noaa_future_daily, aes(x=datetime, y=wind_speed)) +
+  geom_line(aes(group = parameter), alpha = 0.4)+
+  geom_line(data = noaa_past_mean, colour = 'darkblue') +
+  coord_cartesian(xlim = c(noaa_date - days(60),
+                           noaa_date + days(35)))+
+  facet_wrap(~site_id, scales = 'free')
+
 ```
 
 # Model 1: Linear model with covariates
@@ -275,10 +312,12 @@ noaa_future_site <- noaa_future_daily |>
   filter(site_id == example_site)
 
 #Fit linear model based on past data: water temperature = m * air temperature + b
-fit <- lm(site_target$temperature ~ site_target$air_temperature)
+fit <- lm(site_target$temperature ~ site_target$air_temperature + site_target$wind_speed)
     
 # use linear regression to forecast water temperature for each ensemble member
-forecasted_temperature <- fit$coefficients[1] + fit$coefficients[2] * noaa_future_site$air_temperature
+# Jorrit: I just added the effect of wind speed, even though it's not significant
+forecasted_temperature <- fit$coefficients[1] + fit$coefficients[2] * noaa_future_site$air_temperature +
+  fit$coefficients[3] * noaa_future_site$wind_speed
 
 ```
 
@@ -301,11 +340,13 @@ for(i in 1:length(lake_sites$field_site_id)) {
     filter(site_id == example_site)
   
   #Fit linear model based on past data: water temperature = m * air temperature + b
-  fit <- lm(site_target$temperature ~ site_target$air_temperature)
+  fit <- lm(site_target$temperature ~ site_target$air_temperature + site_target$wind_speed)
   # fit <- lm(site_target$temperature ~ ....)
-    
+  # This would be where you can modify the forecast
+  
   # use linear regression to forecast water temperature for each ensemble member
-  forecasted_temperature <- fit$coefficients[1] + fit$coefficients[2] * noaa_future_site$air_temperature
+  forecasted_temperature <- fit$coefficients[1] + fit$coefficients[2] * noaa_future_site$air_temperature +
+    fit$coefficients[3] * noaa_future_site$wind_speed
     
   # put all the relavent information into a tibble that we can bind together
   temperature <- tibble(datetime = noaa_future_site$datetime,
@@ -368,7 +409,7 @@ We need to make sure the dataframe is in the correct format and then we can subm
 
 ```{r}
 # Remember to change the model_id when you make changes to the model structure!
-my_model_id <- 'example_ID'
+my_model_id <- 'JorritsCrystalBall'
 
 temp_lm_forecast_EFI <- temp_lm_forecast %>%
   mutate(model_id = my_model_id,
